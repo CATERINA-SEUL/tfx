@@ -32,7 +32,6 @@ from tensorflow_transform import graph_tools
 import tensorflow_transform.beam as tft_beam
 from tensorflow_transform.beam import impl as tft_beam_impl
 from tensorflow_transform.saved import saved_transform_io
-from tensorflow_transform.saved import saved_transform_io_v2
 from tensorflow_transform.tf_metadata import dataset_metadata
 from tensorflow_transform.tf_metadata import schema_utils
 import tfx
@@ -73,7 +72,6 @@ class _AnalyzeAndTransformDataset(beam.PTransform):
                tfxio,
                preprocessing_fn,
                transform_input_dataset_metadata,
-               force_tf_compat_v1=True,
                max_num_examples=None,
                generate_dataset=False):
     """Constructor.
@@ -83,8 +81,6 @@ class _AnalyzeAndTransformDataset(beam.PTransform):
       tfxio: A `tfx_bsl.TFXIO` instance.
       preprocessing_fn: preprocessing_fn.
       transform_input_dataset_metadata: dataset_metadata.DatasetMetadata.
-      force_tf_compat_v1: If False then Transform will use its native TF2
-        version, if True then Transform will use its TF1 version.
       max_num_examples: Max number of examples to read from the dataset.
       generate_dataset: If True, generates the raw dataset and appropriate
         intermediate outputs (just the TFT SavedModel for now) necessary for
@@ -94,7 +90,6 @@ class _AnalyzeAndTransformDataset(beam.PTransform):
     self._tfxio = tfxio
     self._preprocessing_fn = preprocessing_fn
     self._transform_input_dataset_metadata = transform_input_dataset_metadata
-    self._force_tf_compat_v1 = force_tf_compat_v1
     self._max_num_examples = max_num_examples
     self._generate_dataset = generate_dataset
 
@@ -102,9 +97,7 @@ class _AnalyzeAndTransformDataset(beam.PTransform):
     # TODO(b/147620802): Consider making this (and other parameters)
     # configurable to test more variants (e.g. with and without deep-copy
     # optimisation, with and without cache, etc).
-    with tft_beam.Context(
-        temp_dir=tempfile.mkdtemp(),
-        force_tf_compat_v1=self._force_tf_compat_v1):
+    with tft_beam.Context(temp_dir=tempfile.mkdtemp()):
       raw_data = (
           pipeline
           | "ReadDataset" >> beam.Create(
@@ -117,8 +110,7 @@ class _AnalyzeAndTransformDataset(beam.PTransform):
 
       if self._generate_dataset:
         _ = transform_fn | "CopySavedModel" >> _CopySavedModel(
-            dest_path=self._dataset.tft_saved_model_path(
-                self._force_tf_compat_v1))
+            dest_path=self._dataset.tft_saved_model_path())
 
       (transformed_dataset, transformed_metadata) = (
           ((raw_data, self._tfxio.TensorAdapterConfig()),
@@ -164,9 +156,7 @@ def _get_common_variables(dataset):
       tfxio=tfxio)
 
 
-def regenerate_intermediates_for_dataset(dataset,
-                                         force_tf_compat_v1=True,
-                                         max_num_examples=None):
+def regenerate_intermediates_for_dataset(dataset, max_num_examples=None):
   """Regenerate intermediate outputs required for the benchmark."""
 
   common_variables = _get_common_variables(dataset)
@@ -178,7 +168,6 @@ def regenerate_intermediates_for_dataset(dataset,
         common_variables.tfxio,
         common_variables.preprocessing_fn,
         common_variables.transform_input_dataset_metadata,
-        force_tf_compat_v1=force_tf_compat_v1,
         max_num_examples=max_num_examples,
         generate_dataset=True)
   logging.info("Intermediate outputs regenerated.")
@@ -227,8 +216,12 @@ class TFTBenchmarkBase(benchmark_base.BenchmarkBase):
                                       getattr(tft, "__version__", None))
     super(TFTBenchmarkBase, self).report_benchmark(**kwargs)
 
-  def _benchmarkAnalyzeAndTransformDatasetCommon(self, force_tf_compat_v1):
-    """Common implementation to benchmark AnalyzeAndTransformDataset."""
+  def benchmarkAnalyzeAndTransformDataset(self):
+    """Benchmark AnalyzeAndTransformDataset.
+
+    Runs AnalyzeAndTransformDataset in a Beam pipeline. Records the wall time
+    taken for the whole pipeline.
+    """
     common_variables = _get_common_variables(self._dataset)
 
     pipeline = self._create_beam_pipeline()
@@ -237,7 +230,6 @@ class TFTBenchmarkBase(benchmark_base.BenchmarkBase):
         common_variables.tfxio,
         common_variables.preprocessing_fn,
         common_variables.transform_input_dataset_metadata,
-        force_tf_compat_v1=force_tf_compat_v1,
         max_num_examples=self._max_num_examples())
     start = time.time()
     result = pipeline.run()
@@ -253,24 +245,12 @@ class TFTBenchmarkBase(benchmark_base.BenchmarkBase):
                 self._dataset.num_examples(limit=self._max_num_examples())
         })
 
-  def benchmarkAnalyzeAndTransformDataset(self):
-    """Benchmark AnalyzeAndTransformDataset for TFT's TF1 implementation.
+  def benchmarkRunMetaGraphDoFnManualActuation(self):
+    """Benchmark RunMetaGraphDoFn "manually".
 
-    Runs AnalyzeAndTransformDataset in a Beam pipeline. Records the wall time
-    taken for the whole pipeline.
+    Runs RunMetaGraphDoFn "manually" outside of a Beam pipeline. Records the
+    wall time taken.
     """
-    self._benchmarkAnalyzeAndTransformDatasetCommon(force_tf_compat_v1=True)
-
-  def benchmarkTF2AnalyzeAndTransformDataset(self):
-    """Benchmark AnalyzeAndTransformDataset for TFT's TF2 implementation.
-
-    Runs AnalyzeAndTransformDataset in a Beam pipeline. Records the wall time
-    taken for the whole pipeline.
-    """
-    self._benchmarkAnalyzeAndTransformDatasetCommon(force_tf_compat_v1=False)
-
-  def _benchmarkRunMetaGraphDoFnManualActuationCommon(self, force_tf_compat_v1):
-    """Common implementation to benchmark RunMetaGraphDoFn "manually"."""
     common_variables = _get_common_variables(self._dataset)
     batch_size, batched_records = _get_batched_records(self._dataset,
                                                        self._max_num_examples())
@@ -279,7 +259,8 @@ class TFTBenchmarkBase(benchmark_base.BenchmarkBase):
         shared_graph_state_handle=shared.Shared(),
         passthrough_keys=set(),
         exclude_outputs=None,
-        use_tf_compat_v1=force_tf_compat_v1,
+        # TODO(b/149997088): Add a benchmark with use_tf_compat_v1=False.
+        use_tf_compat_v1=True,
         input_tensor_adapter_config=common_variables.tfxio.TensorAdapterConfig(
         ))
     fn.setup()
@@ -288,9 +269,7 @@ class TFTBenchmarkBase(benchmark_base.BenchmarkBase):
     for batch in batched_records:
       _ = list(
           fn.process(
-              batch,
-              saved_model_dir=self._dataset.tft_saved_model_path(
-                  force_tf_compat_v1)))
+              batch, saved_model_dir=self._dataset.tft_saved_model_path()))
     end = time.time()
     delta = end - start
     self.report_benchmark(
@@ -303,26 +282,9 @@ class TFTBenchmarkBase(benchmark_base.BenchmarkBase):
                 self._dataset.num_examples(limit=self._max_num_examples())
         })
 
-  def benchmarkRunMetaGraphDoFnManualActuation(self):
-    """Benchmark RunMetaGraphDoFn "manually" for TFT's TF1 implementation.
-
-    Runs RunMetaGraphDoFn "manually" outside of a Beam pipeline. Records the
-    wall time taken.
-    """
-    self._benchmarkRunMetaGraphDoFnManualActuationCommon(
-        force_tf_compat_v1=True)
-
-  def benchmarkTF2RunMetaGraphDoFnManualActuation(self):
-    """Benchmark RunMetaGraphDoFn "manually" for TFT's TF2 implementation.
-
-    Runs RunMetaGraphDoFn "manually" outside of a Beam pipeline. Records the
-    wall time taken.
-    """
-    self._benchmarkRunMetaGraphDoFnManualActuationCommon(
-        force_tf_compat_v1=False)
-
+  # TODO(b/149997088): Add a TF2 variant of this benchmark.
   def benchmarkRunMetagraphDoFnAtTFLevel(self):
-    """Benchmark RunMetaGraphDoFn at the TF level for TFT's TF1 implementation.
+    """Benchmark RunMetaGraphDoFn at the TF level.
 
     Benchmarks the parts of RunMetaGraphDoFn that involve feeding and
     fetching from the TFT SavedModel. Records the wall time taken.
@@ -340,8 +302,7 @@ class TFTBenchmarkBase(benchmark_base.BenchmarkBase):
       with session.as_default():
         inputs, outputs = (
             saved_transform_io.partially_apply_saved_transform_internal(
-                self._dataset.tft_saved_model_path(force_tf_compat_v1=True),
-                {}))
+                self._dataset.tft_saved_model_path(), {}))
         session.run(tf.compat.v1.global_variables_initializer())
         session.run(tf.compat.v1.tables_initializer())
         graph.finalize()
@@ -367,53 +328,6 @@ class TFTBenchmarkBase(benchmark_base.BenchmarkBase):
       feed_list = [feed_by_name[name] for name in input_tensor_keys]
       outputs_list = callable_get_outputs(*feed_list)
       _ = {key: value for key, value in zip(outputs_tensor_keys, outputs_list)}
-    end = time.time()
-    delta = end - start
-
-    self.report_benchmark(
-        iters=1,
-        wall_time=delta,
-        extras={
-            "batch_size":
-                batch_size,
-            "num_examples":
-                self._dataset.num_examples(limit=self._max_num_examples())
-        })
-
-  def benchmarkTF2RunMetagraphDoFnAtTFLevel(self):
-    """Benchmark RunMetaGraphDoFn at the TF level for TFT's TF2 implementation.
-
-    Benchmarks the parts of RunMetaGraphDoFn that involve feeding and
-    fetching from the TFT SavedModel. Records the wall time taken.
-
-    Note that this benchmark necessarily duplicates code directly from TFT
-    since it's benchmarking the low-level internals of TFT, which are not
-    exposed for use in this way.
-    """
-    common_variables = _get_common_variables(self._dataset)
-    tensor_adapter_config = common_variables.tfxio.TensorAdapterConfig()
-
-    # This block copied from _GraphStateV2.__init__
-    saved_model_loader = saved_transform_io_v2.SavedModelLoader(
-        self._dataset.tft_saved_model_path(force_tf_compat_v1=False))
-    callable_get_outputs = saved_model_loader.apply_transform_model
-    # We ignore the schema, and assume there are no excluded outputs.
-    outputs_tensor_keys = set(saved_model_loader.structured_outputs.keys())
-    saved_model_loader.finalize(
-        tensor_adapter_config.tensor_representations.keys(),
-        outputs_tensor_keys)
-
-    batch_size, batched_records = _get_batched_records(self._dataset,
-                                                       self._max_num_examples())
-
-    input_tensor_adapter = tensor_adapter.TensorAdapter(tensor_adapter_config)
-
-    # This block copied from _RunMetaGraphDoFn._handle_batch
-    start = time.time()
-    for batch in batched_records:
-      feed_dict = input_tensor_adapter.ToBatchTensors(
-          batch, produce_eager_tensors=True)
-      _ = callable_get_outputs(feed_dict)
     end = time.time()
     delta = end - start
 
